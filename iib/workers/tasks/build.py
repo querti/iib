@@ -339,13 +339,14 @@ def _get_resolved_image(pull_spec):
 
 @retry(attempts=2, wait_on=IIBError, logger=log)
 def _opm_index_add(
-    base_dir, bundles, binary_image, from_index=None, overwrite_from_index_token=None
+    request_id, base_dir, bundles, binary_image, from_index=None, overwrite_from_index_token=None
 ):
     """
     Add the input bundles to an operator index.
 
     This only produces the index.Dockerfile file and does not build the container image.
 
+    :param int request_id: the ID of the request triggering this operation.
     :param str base_dir: the base directory to generate the database and index.Dockerfile in.
     :param list bundles: a list of strings representing the pull specifications of the bundles to
         add to the index image being built.
@@ -356,8 +357,20 @@ def _opm_index_add(
     :param str overwrite_from_index_token: the token used for overwriting the input
         ``from_index`` image. This is required for non-privileged users to use
         ``overwrite_from_index``. The format of the token must be in the format "user:password".
+    :return: False if there are no bundles to add. True otherwise.
     :raises IIBError: if the ``opm index add`` command fails.
     """
+    # If we want to add just one bundle, we don't need to perform this task twice
+    if from_index and len(bundles) > 1:
+        bundles = _exclude_present_bundles(bundles, binary_image, from_index)
+    if not bundles:
+        state_reason = (
+            'All the specified bundles are already present in the index image.'
+            ' No operation will be performed.'
+        )
+        set_request_state(request_id, 'complete', state_reason)
+        return False
+
     # The bundles are not resolved since these are stable tags, and references
     # to a bundle image using a digest fails when using the opm command.
     cmd = [
@@ -379,9 +392,80 @@ def _opm_index_add(
         cmd.extend(['--from-index', from_index])
 
     with set_registry_token(overwrite_from_index_token, from_index):
-        run_cmd(
-            cmd, {'cwd': base_dir}, exc_msg='Failed to add the bundles to the index image',
-        )
+        try:
+            run_cmd(cmd, {'cwd': base_dir}, exc_msg='Failed to add the bundles to the index image')
+        except IIBError as e:
+            if (
+                'Error adding package error loading bundle into db:'
+                ' UNIQUE constraint failed: operatorbundle.name' in str(e)
+            ):
+                log.debug('Bundle %s already in the index image', bundles[0])
+                state_reason = (
+                    'All the specified bundles are already present in the index image.'
+                    ' No operation will be performed.'
+                )
+                set_request_state(request_id, 'complete', state_reason)
+                return False
+            else:
+                raise
+
+    return True
+
+
+def _exclude_present_bundles(bundles, binary_image, from_index):
+    """
+    Filter bundle images to only include those which aren't already present in the index image.
+
+    Due to non-existent API and non-specific error message, bundles have to be added one by one
+    to figure out if they are already present.
+
+    :param list bundles: a list of strings representing the pull specifications of the bundles to
+        check whether they already are in the index image or not.
+    :param str binary_image: the pull specification of the container image where the opm binary
+        gets copied from. This should point to a digest or stable tag.
+    :param str from_index: the pull specification of the container image containing the index that
+        the bundles will be checked against.
+    :return: filtered list of bundles that aren't already present in the index image.
+    :raises IIBError: if the ``opm index add`` command fails for reason other than
+        'UNIQUE constraint failed: operatorbundle.name'
+    """
+    log.info(
+        'Checking the index image for the presence of the following bundle(s): %s',
+        ', '.join(bundles),
+    )
+
+    filtered_bundles = []
+    for bundle in bundles:
+        cmd = [
+            'opm',
+            'index',
+            'add',
+            '--generate',
+            '--bundles',
+            bundle,
+            '--binary-image',
+            binary_image,
+            '--from-index',
+            from_index,
+        ]
+
+        with tempfile.TemporaryDirectory(prefix='iib-') as temp_dir:
+            try:
+                run_cmd(cmd, {'cwd': temp_dir})
+                filtered_bundles.append(bundle)
+            except IIBError as e:
+                if (
+                    'Error adding package error loading bundle into db:'
+                    ' UNIQUE constraint failed: operatorbundle.name' in str(e)
+                ):
+                    log.debug('Bundle %s already in the index image', bundle)
+                else:
+                    raise
+
+    log.debug(
+        'Index image doesn\'t contain the following bundle(s): %s', ', '.join(filtered_bundles)
+    )
+    return filtered_bundles
 
 
 @retry(attempts=2, wait_on=IIBError, logger=log)
@@ -784,13 +868,15 @@ def handle_add_request(
     _update_index_image_build_state(request_id, prebuild_info)
 
     with tempfile.TemporaryDirectory(prefix='iib-') as temp_dir:
-        _opm_index_add(
+        if not _opm_index_add(
+            request_id,
             temp_dir,
             resolved_bundles,
             prebuild_info['binary_image_resolved'],
             from_index,
             overwrite_from_index_token,
-        )
+        ):
+            return
 
         _add_ocp_label_to_index(
             prebuild_info['ocp_version'], temp_dir, 'index.Dockerfile',

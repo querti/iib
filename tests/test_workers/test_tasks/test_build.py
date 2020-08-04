@@ -314,9 +314,14 @@ def test_get_resolved_bundles_failure(mock_si):
 @mock.patch('iib.workers.tasks.build.run_cmd')
 def test_opm_index_add(mock_run_cmd, mock_srt, from_index):
     bundles = ['bundle:1.2', 'bundle:1.3']
-    build._opm_index_add('/tmp/somedir', bundles, 'binary-image:latest', from_index, 'user:pass')
+    assert build._opm_index_add(
+        1, '/tmp/somedir', bundles, 'binary-image:latest', from_index, 'user:pass'
+    )
 
-    mock_run_cmd.assert_called_once()
+    if not from_index:
+        mock_run_cmd.assert_called_once()
+    else:
+        assert mock_run_cmd.call_count == 3
     opm_args = mock_run_cmd.call_args[0][0]
     assert opm_args[0:3] == ['opm', 'index', 'add']
     assert ','.join(bundles) in opm_args
@@ -326,6 +331,112 @@ def test_opm_index_add(mock_run_cmd, mock_srt, from_index):
     else:
         assert '--from-index' not in opm_args
     mock_srt.assert_called_once_with('user:pass', from_index)
+
+
+@mock.patch('iib.workers.tasks.build.set_request_state')
+@mock.patch('iib.workers.tasks.build.set_registry_token')
+@mock.patch('iib.workers.tasks.build.run_cmd')
+def test_opm_index_add_bundle_present(mock_run_cmd, mock_srt, mock_srs):
+    mock_run_cmd.side_effect = IIBError(
+        'error loading bundle from image: Error adding package error loading bundle into db:'
+        ' UNIQUE constraint failed: operatorbundle.name'
+    )
+    bundles = ['bundle:1.2']
+    assert not build._opm_index_add(
+        1, '/tmp/somedir', bundles, 'binary-image:latest', 'some_index:latest', 'user:pass'
+    )
+
+    mock_run_cmd.assert_called_once()
+    opm_args = mock_run_cmd.call_args[0][0]
+    assert opm_args[0:3] == ['opm', 'index', 'add']
+    assert ','.join(bundles) in opm_args
+    assert '--from-index' in opm_args
+    assert 'some_index:latest' in opm_args
+
+    mock_srt.assert_called_once_with('user:pass', 'some_index:latest')
+    mock_srs.assert_called()
+
+
+@mock.patch('iib.workers.tasks.build.set_request_state')
+@mock.patch('iib.workers.tasks.build.set_registry_token')
+@mock.patch('iib.workers.tasks.build.run_cmd')
+def test_opm_index_add_bundle_present_multiple(mock_run_cmd, mock_srt, mock_srs):
+    mock_run_cmd.side_effect = [
+        IIBError(
+            'error loading bundle from image: Error adding package error loading bundle into db:'
+            ' UNIQUE constraint failed: operatorbundle.name'
+        ),
+        None,
+        None,
+    ]
+
+    bundles = ['bundle:1.2', 'bundle:1.3']
+    assert build._opm_index_add(
+        1, '/tmp/somedir', bundles, 'binary-image:latest', 'some_index:latest', 'user:pass'
+    )
+
+    assert mock_run_cmd.call_count == 3
+    opm_args = mock_run_cmd.call_args[0][0]
+    assert opm_args[0:3] == ['opm', 'index', 'add']
+    assert 'bundle:1.2' not in opm_args
+    assert 'bundle:1.3' in opm_args
+    assert '--from-index' in opm_args
+    assert 'some_index:latest' in opm_args
+
+    mock_srt.assert_called_once_with('user:pass', 'some_index:latest')
+    mock_srs.assert_not_called()
+
+
+@mock.patch('iib.workers.tasks.build.run_cmd')
+def test_exclude_present_bundles_one_present(mock_run_cmd):
+    bundles = ['bundle:1.2', 'bundle:1.3']
+    mock_run_cmd.side_effect = [
+        IIBError(
+            'error loading bundle from image: Error adding package error loading bundle into db:'
+            ' UNIQUE constraint failed: operatorbundle.name'
+        ),
+        None,
+    ]
+
+    assert build._exclude_present_bundles(bundles, 'binary-image:latest', 'some_index:latest') == [
+        'bundle:1.3'
+    ]
+
+    assert bundles[0] in mock_run_cmd.call_args_list[0][0][0]
+    assert bundles[1] not in mock_run_cmd.call_args_list[0][0][0]
+    assert bundles[0] not in mock_run_cmd.call_args_list[1][0][0]
+    assert bundles[1] in mock_run_cmd.call_args_list[1][0][0]
+
+
+@mock.patch('iib.workers.tasks.build.run_cmd')
+def test_exclude_present_bundles_all_present(mock_run_cmd):
+    bundles = ['bundle:1.2', 'bundle:1.3']
+    mock_run_cmd.side_effect = [
+        IIBError(
+            'error loading bundle from image: Error adding package error loading bundle into db:'
+            ' UNIQUE constraint failed: operatorbundle.name'
+        )
+    ] * 2
+
+    assert build._exclude_present_bundles(bundles, 'binary-image:latest', 'some_index:latest') == []
+
+    assert bundles[0] in mock_run_cmd.call_args_list[0][0][0]
+    assert bundles[1] not in mock_run_cmd.call_args_list[0][0][0]
+    assert bundles[0] not in mock_run_cmd.call_args_list[1][0][0]
+    assert bundles[1] in mock_run_cmd.call_args_list[1][0][0]
+
+
+@mock.patch('iib.workers.tasks.build.run_cmd')
+def test_exclude_present_bundles_other_exception(mock_run_cmd):
+    bundles = ['bundle:1.2']
+    mock_run_cmd.side_effect = IIBError('Other exception')
+
+    try:
+        build._exclude_present_bundles(bundles, 'binary-image:latest', 'some_index:latest')
+    except IIBError as e:
+        assert str(e) == 'Other exception'
+    else:
+        raise AssertionError('Unexpected exception should be raised')
 
 
 @mock.patch('iib.workers.tasks.build.set_registry_token')
